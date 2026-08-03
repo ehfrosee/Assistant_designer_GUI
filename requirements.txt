@@ -1,0 +1,32 @@
+# GUI framework
+PyQt6>=6.5.0
+ttkbootstrap>=1.10.0
+
+# OpenAI API client (использует API-ключ из .env)
+openai>=1.0.0
+
+# Environment variables management (для .env)
+python-dotenv>=1.0.0
+
+# Document processing
+python-docx>=1.1.0      # Word documents
+openpyxl>=3.1.0         # Excel files
+pandas>=2.0.0           # Data manipulation for Excel
+pdfplumber>=0.10.0      # PDF text extraction (лучше, чем PyPDF2)
+pytesseract>=0.3.10     # OCR для сканов (опционально, требует Tesseract OCR)
+markdown>=3.4.0
+tiktoken>=0.5.0
+xlrd>=2.0.1
+
+# RAG and vector database
+chromadb>=0.4.22        # Локальная векторная БД
+sentence-transformers>=2.2.2   # Локальные эмбеддинги (запасной вариант)
+tiktoken>=0.5.0         # Подсчёт токенов для OpenAI моделей
+
+# Additional utilities
+numpy>=1.24.0           # Используется chromadb и sentence-transformers
+scikit-learn>=1.3.0     # Альтернативные метрики схожести
+requests>=2.31.0        # HTTP (может потребоваться)
+
+# Configuration management (JSON, пути)
+# json и os встроены, дополнительных библиотек не требуется

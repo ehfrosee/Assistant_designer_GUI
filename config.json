@@ -1,0 +1,39 @@
+{
+  "llm_defaults": {
+    "model": "gpt-4o-mini",
+    "temperature": 0.3,
+    "max_tokens": 10000,
+    "timeout": 180
+  },
+  "paths": {
+    "scenarios_dir": "./scenarios",
+    "rag_db_dir": "./rag_db",
+    "logs_dir": "./logs",
+    "env_file": ".env"
+  },
+  "rag": {
+    "embedding_model": "text-embedding-ada-002",
+    "top_k": 5,
+    "vector_db_type": "faiss"
+  },
+  "ui": {
+    "theme": "light",
+    "language": "ru"
+  },
+  "dialog": {
+    "history_pairs": 3,
+    "summary_pairs": 3,
+    "summary_model": "gpt-4o-mini"
+  },
+  "analysis": {
+    "scenarios_dir": "./scenarios",
+    "default_model": "gpt-4o-mini",
+    "chunk_size_tokens": 60000,
+    "max_retries": 3
+  },
+  "processing": {
+    "enable_chunking": true,
+    "chunk_size_tokens": 5000,
+    "chunk_overlap_tokens": 200
+  }
+}

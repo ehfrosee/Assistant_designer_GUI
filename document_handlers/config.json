@@ -1,0 +1,38 @@
+{
+  "input_settings": {
+    "default_input_directory": "f:\\Документы\\!Проекты\\!2025\\ЧИТА\\",
+    "supported_formats": [".pdf", ".docx", ".xlsx", ".txt", ".md", ".xls"],
+    "folder_filters": ["АОВ", "АТХ", "АСКУЭ", "АСУД", "АТМ", "АК", "СС", "ПС"],
+    "file_filters": ["АОВ", "АТХ", "АСКУЭ", "АСУД", "АТМ", "АК", "СС", "ПС", ".СО"]
+  },
+  "output_settings": {
+    "default_output_directory": "converted_documents",
+    "base_output_directory": "output",
+    "converted_txt_dir": "txt_files",
+    "log_level": "INFO"
+  },
+  "processing_settings": {
+    "max_file_size": 104857600,
+    "cleanup_temp_files": true,
+    "encoding": "utf-8"
+  },
+  "network_settings": {
+    "max_retries": 5,
+    "timeout": 60,
+    "backoff_factor": 1.0
+  },
+  "document_structure": {
+    "extract_metadata": true,
+    "enhance_structure": true,
+    "process_tables": true
+  },
+  "processors": {
+    "docx": {
+      "enabled": true,
+      "extract_headers_footers": true,
+      "extract_tables": true,
+      "detect_headers": true,
+      "max_header_rows": 3
+    }
+  }
+}
