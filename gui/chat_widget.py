@@ -18,49 +18,61 @@ class ChatWidget(Frame):
         self.main_window = main_window
         self.on_send_callback = on_send_callback
 
-        self.paned = ttk.PanedWindow(self, orient=VERTICAL)
+        # Используем tk.PanedWindow вместо ttk
+        self.paned = tk.PanedWindow(self, orient=VERTICAL)
         self.paned.pack(fill=BOTH, expand=True)
 
-        # Область чата
+        # ---------- Область чата ----------
         self.chat_area = scrolledtext.ScrolledText(
             self.paned, wrap=WORD, state=DISABLED,
             font=("Segoe UI", 10)
         )
-        self.paned.add(self.chat_area, weight=3)
+        self.paned.add(self.chat_area)
+        self.paned.paneconfig(self.chat_area, stretch='always', minsize=100)
 
         self._setup_chat_context_menu()
         self.chat_area.bind("<Control-KeyPress>", self._on_ctrl_key_chat)
 
-        # Панель ввода и кнопки
+        # ---------- Панель ввода и кнопки ----------
         input_frame = Frame(self.paned)
-        self.paned.add(input_frame, weight=1)
+        self.paned.add(input_frame)
+        self.paned.paneconfig(input_frame, stretch='always', minsize=80)
 
-        self.input_field = Text(input_frame, height=4, wrap=WORD, font=("Segoe UI", 10))
-        self.input_field.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 5))
+        input_container = Frame(input_frame)
+        input_container.pack(fill=BOTH, expand=True)
 
+        input_container.grid_rowconfigure(0, weight=1)
+        input_container.grid_columnconfigure(0, weight=1)
+        input_container.grid_columnconfigure(1, weight=0)
+
+        self.input_field = Text(input_container, height=4, wrap=WORD, font=("Segoe UI", 10))
+        self.input_field.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         self.input_field.bind("<Control-KeyPress>", self._on_ctrl_key_input)
 
+        buttons_frame = Frame(input_container)
+        buttons_frame.grid(row=0, column=1, sticky="ns")
+
         self.send_btn = tb.Button(
-            input_frame, text="Отправить", bootstyle="primary",
+            buttons_frame, text="Отправить", bootstyle="primary",
             command=self._send_message
         )
-        self.send_btn.pack(side=RIGHT)
-        self.input_field.bind("<Control-Return>", lambda e: self._send_message())
+        self.send_btn.pack(side=LEFT, padx=1, pady=1)
 
-        # Кнопки загрузки/сохранения промпта
         self.load_prompt_btn = tb.Button(
-            input_frame, text="📂", bootstyle="secondary",
+            buttons_frame, text="📂", bootstyle="secondary",
             command=self._load_prompt_from_dialog, width=3
         )
-        self.load_prompt_btn.pack(side=RIGHT, padx=1)
+        self.load_prompt_btn.pack(side=LEFT, padx=1, pady=1)
 
         self.save_prompt_btn = tb.Button(
-            input_frame, text="💾", bootstyle="secondary",
+            buttons_frame, text="💾", bootstyle="secondary",
             command=self._save_prompt_to_dialog, width=3
         )
-        self.save_prompt_btn.pack(side=RIGHT, padx=1)
+        self.save_prompt_btn.pack(side=LEFT, padx=1, pady=1)
 
-        # Теги форматирования
+        self.input_field.bind("<Control-Return>", lambda e: self._send_message())
+
+        # ---------- Теги форматирования ----------
         self.chat_area.tag_config("user_header", font=("Segoe UI", 9, "bold"), foreground="blue")
         self.chat_area.tag_config("assistant_header", font=("Segoe UI", 9, "bold"), foreground="green")
         self.chat_area.tag_config("user_text", font=("Segoe UI", 10), lmargin1=10, lmargin2=10, rmargin=10)
@@ -74,6 +86,7 @@ class ChatWidget(Frame):
         self.chat_context_menu.add_separator()
         self.chat_context_menu.add_command(label="Сохранить выделенное как файл", command=self._save_selected_as_file)
         self.chat_context_menu.add_command(label="Сохранить выделенное по разделам", command=self._save_selected_as_sections)
+        self.chat_context_menu.add_command(label="Сохранить выделенное как DOCX", command=self._save_selected_as_docx)
         self.chat_area.bind("<Button-3>", self._show_chat_context_menu)
 
     def _show_chat_context_menu(self, event):
@@ -113,6 +126,12 @@ class ChatWidget(Frame):
             self.main_window._save_selected_as_sections()
         else:
             messagebox.showerror("Ошибка", "Метод сохранения по разделам не найден в главном окне.")
+
+    def _save_selected_as_docx(self):
+        if hasattr(self.main_window, '_save_selected_as_docx'):
+            self.main_window._save_selected_as_docx()
+        else:
+            messagebox.showerror("Ошибка", "Метод сохранения DOCX не найден в главном окне.")
 
     # ---------- Обработчики Ctrl+Key ----------
     def _on_ctrl_key_chat(self, event):

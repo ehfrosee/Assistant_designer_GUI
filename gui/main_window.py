@@ -232,9 +232,243 @@ class MainWindow(tb.Window):
         if errors:
             self.add_system_message(f"⚠️ Ошибки при сохранении:\n" + "\n".join(errors))
 
+    def _detect_list_type(self, line: str) -> tuple:
+        """
+        Определяет тип списка и уровень вложенности.
+        Возвращает (list_type, level, content, list_index)
+        list_type: 'ordered' (1. 2. 3.), 'unordered' (-, *), None
+        level: уровень вложенности (по количеству пробелов/табов)
+        list_index: номер элемента для нумерованного списка (1, 2, 3...)
+        """
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        level = indent // 4  # предполагаем 4 пробела на уровень
+
+        import re
+
+        # Проверяем на нумерованный список (1. 2. 3. и т.д.)
+        ordered_match = re.match(r'^(\d+)\.\s+(.*)$', stripped)
+        if ordered_match:
+            index = int(ordered_match.group(1))
+            return ('ordered', level, ordered_match.group(2), index)
+
+        # Проверяем на маркированный список (-, *, •)
+        if stripped.startswith('- ') or stripped.startswith('* ') or stripped.startswith('• '):
+            content = stripped[2:].strip()
+            return ('unordered', level, content, None)
+
+        # Проверяем на вложенный нумерованный список (1.1, 1.2, 2.1 и т.д.)
+        sub_ordered_match = re.match(r'^(\d+\.\d+)\s+(.*)$', stripped)
+        if sub_ordered_match:
+            return ('ordered', level + 1, sub_ordered_match.group(2), None)
+
+        return (None, 0, stripped, None)
+
+    def _save_selected_as_docx(self):
+        """Сохраняет выделенный текст чата в DOCX с поддержкой маркированных списков."""
+        from docx import Document
+        from docx.shared import Pt, Inches
+        from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+        import re
+
+        selected = self.chat_widget.get_selected_text()
+        if not selected:
+            messagebox.showwarning("Сохранение", "Ничего не выделено в чате.")
+            return
+
+        first_line = selected.splitlines()[0].strip() if selected else ""
+        if not first_line:
+            first_line = "selected_text"
+
+        base_name = self._safe_filename(first_line, "selected_text")
+        default_ext = ".docx"
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=default_ext,
+            filetypes=[("Документ Word", "*.docx"), ("Все файлы", "*.*")],
+            initialfile=base_name + default_ext,
+            title="Сохранить выделенный текст как DOCX"
+        )
+        if not file_path:
+            return
+
+        doc = Document()
+        lines = selected.splitlines()
+
+        # Стек для отслеживания уровней маркированных списков
+        list_stack = []  # хранит уровень
+
+        def close_lists_up_to(level):
+            """Закрывает все списки, уровень которых >= level."""
+            nonlocal list_stack
+            while list_stack and list_stack[-1] >= level:
+                list_stack.pop()
+
+        def add_list_item(level, content):
+            """Добавляет элемент маркированного списка."""
+            nonlocal list_stack
+
+            close_lists_up_to(level)
+
+            p = doc.add_paragraph()
+
+            if level == 0:
+                p.style = 'List Bullet'
+            elif level == 1:
+                p.style = 'List Bullet 2'
+            elif level == 2:
+                p.style = 'List Bullet 3'
+            else:
+                p.style = 'List Bullet 4'
+
+            p.paragraph_format.left_indent = Inches(0.25 + level * 0.25)
+            self._apply_inline_formatting(p, content)
+            list_stack.append(level)
+
+        def add_regular_paragraph(text):
+            """Добавляет обычный параграф."""
+            nonlocal list_stack
+            list_stack = []
+
+            p = doc.add_paragraph()
+            p.paragraph_format.space_after = Pt(0)
+            self._apply_inline_formatting(p, text)
+
+        in_code_block = False
+        code_block_lines = []
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            i += 1
+
+            # Обработка кодовых блоков
+            if line.strip().startswith('```'):
+                if in_code_block:
+                    if code_block_lines:
+                        p = doc.add_paragraph()
+                        run = p.add_run('\n'.join(code_block_lines))
+                        run.font.name = 'Courier New'
+                        run.font.size = Pt(9)
+                        code_block_lines = []
+                    in_code_block = False
+                else:
+                    in_code_block = True
+                continue
+
+            if in_code_block:
+                code_block_lines.append(line)
+                continue
+
+            # Пропускаем пустые строки
+            if not line.strip():
+                doc.add_paragraph()
+                continue
+
+            # Проверяем, является ли строка элементом маркированного списка (-, *, •)
+            stripped = line.lstrip()
+            indent = len(line) - len(stripped)
+            level = indent // 4  # 4 пробела = 1 уровень
+
+            is_bullet = (
+                    stripped.startswith('- ') or
+                    stripped.startswith('* ') or
+                    stripped.startswith('• ')
+            )
+
+            if is_bullet:
+                content = stripped[2:].strip()
+                add_list_item(level, content)
+            else:
+                # Проверяем на заголовки
+                header_match = re.match(r'^(#+)\s+(.*)$', line)
+                if header_match:
+                    list_stack = []
+                    level = len(header_match.group(1))
+                    text = header_match.group(2)
+                    p = doc.add_paragraph()
+                    run = p.add_run(text)
+                    run.bold = True
+                    if level == 1:
+                        run.font.size = Pt(18)
+                        p.style = 'Heading 1'
+                    elif level == 2:
+                        run.font.size = Pt(16)
+                        p.style = 'Heading 2'
+                    elif level == 3:
+                        run.font.size = Pt(14)
+                        p.style = 'Heading 3'
+                    elif level >= 4:
+                        run.font.size = Pt(12)
+                        p.style = 'Heading 4'
+                else:
+                    # Проверяем на числовые списки и преобразуем их в обычный текст
+                    number_match = re.match(r'^(\d+)\.\s+(.*)$', stripped)
+                    if number_match:
+                        # Нумерованные списки преобразуем в обычный текст с номером
+                        content = number_match.group(2)
+                        p = doc.add_paragraph()
+                        p.paragraph_format.space_after = Pt(0)
+                        # Добавляем номер как обычный текст
+                        run = p.add_run(f"{number_match.group(1)}. ")
+                        run.bold = True
+                        self._apply_inline_formatting(p, content)
+                    else:
+                        add_regular_paragraph(line)
+
+        list_stack = []
+
+        try:
+            doc.save(file_path)
+            self.statusbar.config(text=f"Выделенный текст сохранён в DOCX: {file_path}")
+            self.add_system_message(f"📄 Выделенный текст сохранён в DOCX: {file_path}")
+        except Exception as e:
+            messagebox.showerror("Ошибка сохранения", f"Не удалось сохранить файл:\n{e}")
+
+    def _apply_inline_formatting(self, paragraph, text: str):
+        """
+        Применяет inline-форматирование к тексту в параграфе.
+        Поддерживает:
+        - **жирный** (или __жирный__)
+        - *курсив* (или _курсив_)
+        - `код`
+        """
+        import re
+
+        # Сначала обрабатываем **жирный** и __жирный__
+        parts = re.split(r'(\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_|`[^`]+`)', text)
+
+        for part in parts:
+            if not part:
+                continue
+
+            # Жирный: **текст** или __текст__
+            if (part.startswith('**') and part.endswith('**')):
+                run = paragraph.add_run(part[2:-2])
+                run.bold = True
+            elif (part.startswith('__') and part.endswith('__')):
+                run = paragraph.add_run(part[2:-2])
+                run.bold = True
+
+            # Курсив: *текст* или _текст_
+            elif (part.startswith('*') and part.endswith('*')):
+                run = paragraph.add_run(part[1:-1])
+                run.italic = True
+            elif (part.startswith('_') and part.endswith('_')):
+                run = paragraph.add_run(part[1:-1])
+                run.italic = True
+
+            # Код: `код`
+            elif part.startswith('`') and part.endswith('`'):
+                run = paragraph.add_run(part[1:-1])
+                run.font.name = 'Courier New'
+
+            # Обычный текст
+            else:
+                paragraph.add_run(part)
+
     # ---------- Построение пользовательского интерфейса ----------
     def init_ui(self):
-        """Создаёт все элементы главного окна: меню, вкладки, панели"""
         self.title("AI Document Analyst (Chat)")
         self.geometry("900x600")
         self.minsize(600, 400)
@@ -243,12 +477,10 @@ class MainWindow(tb.Window):
         menubar = tb.Menu(self)
         self.config(menu=menubar)
 
-        # Меню "Файл"
         file_menu = tb.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Файл", menu=file_menu)
         file_menu.add_command(label="Выход", command=self.destroy)
 
-        # Меню "Диалог"
         dialog_menu = tb.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Диалог", menu=dialog_menu)
         dialog_menu.add_command(label="Новый диалог", command=self.new_dialog)
@@ -262,7 +494,6 @@ class MainWindow(tb.Window):
         dialog_menu.add_command(label="Загрузить промпт", command=self._load_prompt_global)
         dialog_menu.add_command(label="Сохранить промпт", command=self._save_prompt_global)
 
-        # Меню "Инструменты"
         tools_menu = tb.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Инструменты", menu=tools_menu)
         tools_menu.add_command(label="Копировать чат", command=self.copy_chat)
@@ -274,7 +505,6 @@ class MainWindow(tb.Window):
         tools_menu.add_command(label="Очистить чат", command=self.clear_chat)
         tools_menu.add_command(label="Настройки", command=self.open_settings)
 
-        # Меню "Команды"
         commands_menu = tb.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Команды", menu=commands_menu)
         commands_menu.add_command(label="📄 Загрузить документ", command=self._cmd_load_document_dialog)
@@ -285,10 +515,10 @@ class MainWindow(tb.Window):
         commands_menu.add_separator()
         commands_menu.add_command(label="📁 Импортировать папку", command=self._cmd_import_folder_dialog)
 
-        # Подменю "Экспортировать результат"
         export_menu = tb.Menu(commands_menu, tearoff=0)
         commands_menu.add_cascade(label="💾 Экспортировать результат", menu=export_menu)
-        for fmt, label in [("json", "JSON"), ("csv", "CSV"), ("md", "Markdown (MD)"), ("docx", "Word (DOCX)"), ("xlsx", "Excel (XLSX)")]:
+        for fmt, label in [("json", "JSON"), ("csv", "CSV"), ("md", "Markdown (MD)"), ("docx", "Word (DOCX)"),
+                           ("xlsx", "Excel (XLSX)")]:
             export_menu.add_command(label=label, command=lambda f=fmt: self._cmd_export_result(f))
 
         commands_menu.add_separator()
@@ -297,14 +527,44 @@ class MainWindow(tb.Window):
         commands_menu.add_separator()
         commands_menu.add_command(label="❓ Помощь", command=self._cmd_help)
 
-        # Меню "Помощь"
         help_menu = tb.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Помощь", menu=help_menu)
         help_menu.add_command(label="О программе", command=self.show_about)
 
-        # ---- Основной контент: вкладки ----
+        # ---- Статусная строка (САМАЯ ПЕРВАЯ упаковка, будет внизу) ----
+        self.statusbar = tb.Label(self, text="Готов", bootstyle="info", anchor=W)
+        self.statusbar.pack(side=BOTTOM, fill=X)
+
+        # ---- Панель загрузки файлов (вторая упаковка, над статусной) ----
+        file_frame = Frame(self)
+        file_frame.pack(fill=X, side=BOTTOM, padx=5, pady=2)
+        file_frame.config(height=35)
+        file_frame.pack_propagate(False)
+
+        self.attach_btn = tb.Button(
+            file_frame, text="📎 Прикрепить файл", bootstyle="secondary",
+            command=self.load_file
+        )
+        self.attach_btn.pack(side=LEFT, padx=2)
+
+        self.file_label = tb.Label(
+            file_frame,
+            text="Файлы не загружены",
+            bootstyle="info",
+            anchor=W
+        )
+        self.file_label.pack(side=LEFT, fill=X, expand=True, padx=10)
+
+        self.clear_file_btn = tb.Button(
+            file_frame, text="✕ Убрать", bootstyle="danger",
+            command=self.clear_file, state=DISABLED,
+            width=8
+        )
+        self.clear_file_btn.pack(side=RIGHT, padx=2)
+
+        # ---- Notebook с вкладками (занимает всё оставшееся пространство) ----
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=BOTH, expand=True)
+        self.notebook.pack(fill=BOTH, expand=True, padx=0, pady=0)
 
         # Вкладка "Чат"
         self.chat_frame = ttk.Frame(self.notebook)
@@ -317,30 +577,7 @@ class MainWindow(tb.Window):
         self.notebook.add(self.analysis_frame, text="Анализ документа")
         self._build_analysis_tab()
 
-        # ---- Панель загрузки файлов и кнопок чата ----
-        file_frame = Frame(self)
-        file_frame.pack(fill=X, padx=5, pady=5)
-
-        self.attach_btn = tb.Button(file_frame, text="📎 Прикрепить файл", bootstyle="secondary", command=self.load_file)
-        self.attach_btn.pack(side=LEFT, padx=2)
-
-        self.file_label = tb.Label(file_frame, text="Файл не загружен", bootstyle="info")
-        self.file_label.pack(side=LEFT, padx=10)
-
-        self.clear_file_btn = tb.Button(file_frame, text="Убрать файл", bootstyle="danger", command=self.clear_file, state=DISABLED)
-        self.clear_file_btn.pack(side=LEFT, padx=2)
-
-        self.copy_chat_btn = tb.Button(file_frame, text="📋 Копировать чат", bootstyle="info", command=self.copy_chat)
-        self.copy_chat_btn.pack(side=RIGHT, padx=2)
-
-        self.save_chat_docx_btn = tb.Button(file_frame, text="💾 Сохранить чат (DOCX)", bootstyle="info", command=self._save_chat_as_docx_wrapper)
-        self.save_chat_docx_btn.pack(side=RIGHT, padx=2)
-
-        # Статусная строка
-        self.statusbar = tb.Label(self, text="Готов", bootstyle="info", anchor=W)
-        self.statusbar.pack(side=BOTTOM, fill=X)
-
-        # Приветственное сообщение
+        # ---- Приветственное сообщение ----
         self.chat_widget.add_message("Приложение запущено. Введите вопрос.", "assistant")
 
     def _build_analysis_tab(self):
@@ -913,10 +1150,13 @@ class MainWindow(tb.Window):
     def _update_file_label(self):
         if self.attached_files:
             names = ", ".join(f[0] for f in self.attached_files)
+            # Обрезаем длинные имена для отображения
+            if len(names) > 60:
+                names = names[:57] + "..."
             self.file_label.config(text=f"📎 Файлы: {names}")
             self.clear_file_btn.config(state=NORMAL)
         else:
-            self.file_label.config(text="Файлы не загружены")
+            self.file_label.config(text="📎 Файлы не загружены")
             self.clear_file_btn.config(state=DISABLED)
 
     def clear_file(self):
