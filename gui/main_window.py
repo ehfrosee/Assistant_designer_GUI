@@ -6,24 +6,15 @@ import threading
 import os
 import glob
 import json
-import io
 import re
 from pathlib import Path
-from datetime import datetime
 from typing import Optional
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, Frame, Label, Text, Toplevel, ttk, Menu
+from tkinter import filedialog, messagebox, Frame, ttk, Menu
 from tkinter import END, DISABLED, NORMAL, LEFT, RIGHT, X, Y, BOTH
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
-import markdown
-import pandas as pd
-from openpyxl import Workbook
-from docx import Document
-from docx.shared import Pt, Inches, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
 
 # ---- Импорты из других модулей проекта ----
 from config.config_manager import ConfigManager
@@ -31,15 +22,16 @@ from core.chat_client import ChatGPTClient
 from gui.file_loader import FileLoader
 from gui.dialog_manager import DialogManager
 from orchestrator.dispatcher import run_analysis
-from gui.scenario_editor import launch_scenario_editor
 
-# Импорты вынесенных виджетов
+# Импорты виджетов и хендлеров
 from gui.chat_widget import ChatWidget
 from gui.settings_dialog import SettingsDialog
+from gui.export_handlers import ExportHandlers
+from gui.selection_handlers import SelectionHandlers
 
 
 class MainWindow(tb.Window):
-    """Главное окно приложения, объединяющее чат, анализ документов по сценариям, команды и настройки"""
+    """Главное окно приложения, объединяющее чат, команды и настройки"""
 
     # ---------- Инициализация и настройка ----------
     def __init__(self, config_manager: ConfigManager):
@@ -55,7 +47,32 @@ class MainWindow(tb.Window):
         self.analysis_thread = None
         self.cancel_event = None
         self.result_format = "text"
+
         self.setup_logging()
+
+        # === Создаём хендлеры ДО вызова init_ui ===
+        self.export_handlers = ExportHandlers(self)
+        self.selection_handlers = SelectionHandlers(self)
+
+        # Перенаправляем методы экспорта
+        self._parse_markdown_table = self.export_handlers._parse_markdown_table
+        self._convert_csv_to_table = self.export_handlers._convert_csv_to_table
+        self._is_likely_csv = self.export_handlers._is_likely_csv
+        self._convert_csv_block_to_table = self.export_handlers._convert_csv_block_to_table
+        self._apply_inline_formatting = self.export_handlers._apply_inline_formatting
+        self._json_to_word_table = self.export_handlers._json_to_word_table
+        self._save_as_docx = self.export_handlers.save_as_docx
+        self._save_as_xlsx = self.export_handlers.save_as_xlsx
+        self._save_chat_as_docx = self.export_handlers.save_chat_as_docx
+
+        # Перенаправляем методы сохранения выделенного
+        self._safe_filename = self.selection_handlers._safe_filename
+        self._detect_list_type = self.selection_handlers._detect_list_type
+        self._save_selected_as_file = self.selection_handlers.save_selected_as_file
+        self._save_selected_as_sections = self.selection_handlers.save_selected_as_sections
+        self._save_selected_as_docx = self.selection_handlers.save_selected_as_docx
+
+        # Теперь можно вызывать init_ui
         self.init_ui()
         self.bind_signals()
         self.check_api_key()
@@ -65,7 +82,28 @@ class MainWindow(tb.Window):
         self.available_models = []
         self.load_models_at_startup()
         self.attached_files = []  # список кортежей (filename, content)
-        self.doc_paths_var = []  # список файлов для анализа (несколько)
+
+        # Инициализация хендлеров
+        self.export_handlers = ExportHandlers(self)
+        self.selection_handlers = SelectionHandlers(self)
+
+        # Перенаправление методов экспорта
+        self._parse_markdown_table = self.export_handlers._parse_markdown_table
+        self._convert_csv_to_table = self.export_handlers._convert_csv_to_table
+        self._is_likely_csv = self.export_handlers._is_likely_csv
+        self._convert_csv_block_to_table = self.export_handlers._convert_csv_block_to_table
+        self._apply_inline_formatting = self.export_handlers._apply_inline_formatting
+        self._json_to_word_table = self.export_handlers._json_to_word_table
+        self._save_as_docx = self.export_handlers.save_as_docx
+        self._save_as_xlsx = self.export_handlers.save_as_xlsx
+        self._save_chat_as_docx = self.export_handlers.save_chat_as_docx
+
+        # Перенаправление методов сохранения выделенного
+        self._safe_filename = self.selection_handlers._safe_filename
+        self._detect_list_type = self.selection_handlers._detect_list_type
+        self._save_selected_as_file = self.selection_handlers.save_selected_as_file
+        self._save_selected_as_sections = self.selection_handlers.save_selected_as_sections
+        self._save_selected_as_docx = self.selection_handlers.save_selected_as_docx
 
     def setup_logging(self):
         """Настройка логирования в файл и консоль"""
@@ -82,390 +120,6 @@ class MainWindow(tb.Window):
         )
         self.logger = logging.getLogger("main_window")
         logging.getLogger("chat_client").setLevel(logging.DEBUG)
-
-    def _safe_filename(self, title: str, default: str = "untitled") -> str:
-        """Преобразует строку в безопасное имя файла (убирает недопустимые символы)."""
-        import re
-        # Убираем символы, запрещённые в именах файлов Windows/Linux
-        safe = re.sub(r'[<>:"/\\|?*]', '_', title.strip())
-        # Убираем лишние пробелы и точки в конце
-        safe = safe.strip(' .')
-        if not safe:
-            safe = default
-        # Ограничиваем длину
-        if len(safe) > 100:
-            safe = safe[:100]
-        return safe
-
-    def _save_selected_as_file(self):
-        """Сохраняет выделенный текст чата в один файл с именем из первой строки."""
-        selected = self.chat_widget.get_selected_text()
-        if not selected:
-            messagebox.showwarning("Сохранение", "Ничего не выделено в чате.")
-            return
-
-        # Первая строка (до первого переноса) как имя файла
-        first_line = selected.splitlines()[0].strip() if selected else ""
-        if not first_line:
-            first_line = "selected_text"
-
-        base_name = self._safe_filename(first_line, "selected_text")
-        default_ext = ".md" if first_line.startswith('#') else ".txt"
-
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=default_ext,
-            filetypes=[("Текстовые файлы", "*.txt"), ("Markdown", "*.md"), ("Все файлы", "*.*")],
-            initialfile=base_name + default_ext,
-            title="Сохранить выделенный текст"
-        )
-        if not file_path:
-            return
-
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(selected)
-            self.statusbar.config(text=f"Выделенный текст сохранён в {file_path}")
-            self.add_system_message(f"📄 Выделенный текст сохранён в {file_path}")
-        except Exception as e:
-            messagebox.showerror("Ошибка сохранения", f"Не удалось сохранить файл:\n{e}")
-
-    def _save_selected_as_sections(self):
-        """
-        Сохраняет выделенный текст, разделяя по строкам, начинающимся с "---" и содержащим имя файла.
-        Строки, состоящие только из "---" (без имени), игнорируются как разделители.
-        Каждый раздел сохраняется в отдельный файл.
-        Имя файла берётся из строки "--- <имя_файла>".
-        Удаляет обратные кавычки (```) и возможный язык в начале и конце содержимого.
-        """
-        selected = self.chat_widget.get_selected_text()
-        if not selected:
-            messagebox.showwarning("Сохранение", "Ничего не выделено в чате.")
-            return
-
-        import re
-
-        # Ищем строки, начинающиеся с "---" и содержащие имя файла (не только пробелы)
-        pattern = r'(?=^[ \t]*---\s+\S+.*$)'
-        sections = re.split(pattern, selected, flags=re.MULTILINE)
-        sections = [s.strip() for s in sections if s.strip()]
-
-        if not sections:
-            messagebox.showwarning("Сохранение",
-                                   "Выделенный текст не содержит маркеров разделов (строк, начинающихся с '---' и имени файла).")
-            return
-
-        if len(sections) == 1:
-            reply = messagebox.askyesno("Сохранение",
-                                        "Текст не разбит на разделы (только один маркер).\n"
-                                        "Сохранить как один файл?")
-            if reply:
-                self._save_selected_as_file()
-            return
-
-        folder_path = filedialog.askdirectory(title="Выберите папку для сохранения разделов")
-        if not folder_path:
-            return
-
-        saved_count = 0
-        errors = []
-
-        for section in sections:
-            lines = section.splitlines()
-            if not lines:
-                continue
-
-            # Первая строка должна начинаться с "---" и содержать имя файла
-            first_line = lines[0].strip()
-            if not first_line.startswith('---'):
-                # Если маркер отсутствует (например, первый кусок текста до первого маркера), пропускаем
-                # или можно сохранить как unnamed, но лучше пропустить, так как это не полная секция
-                continue
-
-            # Извлекаем имя файла после "---"
-            file_name_part = first_line[3:].strip()
-            file_name_part = file_name_part.strip('"').strip("'")
-            if not file_name_part:
-                # Если имя пустое (что маловероятно при новом pattern), пропускаем
-                continue
-
-            title = file_name_part
-            # Остальные строки (кроме первой) — содержимое
-            content = "\n".join(lines[1:]).strip()
-
-            # Удаляем обратные кавычки и возможный язык в начале/конце
-            if content.startswith('```') and content.endswith('```'):
-                lines_content = content.splitlines()
-                if lines_content and lines_content[0].strip().startswith('```'):
-                    lines_content = lines_content[1:]
-                if lines_content and lines_content[-1].strip() == '```':
-                    lines_content = lines_content[:-1]
-                content = "\n".join(lines_content).strip()
-
-            # Дополнительная очистка от обратных кавычек
-            content = re.sub(r'^```[a-zA-Z]*\s*', '', content)
-            content = re.sub(r'\s*```$', '', content)
-
-            # Формируем имя файла
-            base_name = self._safe_filename(title, "section")
-            # Если имя не содержит расширения, добавляем .txt
-            if '.' not in os.path.splitext(base_name)[1]:
-                base_name += ".txt"
-
-            file_path = os.path.join(folder_path, base_name)
-
-            counter = 1
-            while os.path.exists(file_path):
-                name, ext = os.path.splitext(base_name)
-                file_path = os.path.join(folder_path, f"{name}_{counter}{ext}")
-                counter += 1
-
-            try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                saved_count += 1
-            except Exception as e:
-                errors.append(f"{file_path}: {e}")
-
-        if saved_count > 0:
-            self.statusbar.config(text=f"Сохранено {saved_count} разделов в {folder_path}")
-            self.add_system_message(f"📁 Сохранено {saved_count} разделов в {folder_path}")
-        if errors:
-            self.add_system_message(f"⚠️ Ошибки при сохранении:\n" + "\n".join(errors))
-
-    def _detect_list_type(self, line: str) -> tuple:
-        """
-        Определяет тип списка и уровень вложенности.
-        Возвращает (list_type, level, content, list_index)
-        list_type: 'ordered' (1. 2. 3.), 'unordered' (-, *), None
-        level: уровень вложенности (по количеству пробелов/табов)
-        list_index: номер элемента для нумерованного списка (1, 2, 3...)
-        """
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-        level = indent // 4  # предполагаем 4 пробела на уровень
-
-        import re
-
-        # Проверяем на нумерованный список (1. 2. 3. и т.д.)
-        ordered_match = re.match(r'^(\d+)\.\s+(.*)$', stripped)
-        if ordered_match:
-            index = int(ordered_match.group(1))
-            return ('ordered', level, ordered_match.group(2), index)
-
-        # Проверяем на маркированный список (-, *, •)
-        if stripped.startswith('- ') or stripped.startswith('* ') or stripped.startswith('• '):
-            content = stripped[2:].strip()
-            return ('unordered', level, content, None)
-
-        # Проверяем на вложенный нумерованный список (1.1, 1.2, 2.1 и т.д.)
-        sub_ordered_match = re.match(r'^(\d+\.\d+)\s+(.*)$', stripped)
-        if sub_ordered_match:
-            return ('ordered', level + 1, sub_ordered_match.group(2), None)
-
-        return (None, 0, stripped, None)
-
-    def _save_selected_as_docx(self):
-        """Сохраняет выделенный текст чата в DOCX с поддержкой маркированных списков."""
-        from docx import Document
-        from docx.shared import Pt, Inches
-        from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-        import re
-
-        selected = self.chat_widget.get_selected_text()
-        if not selected:
-            messagebox.showwarning("Сохранение", "Ничего не выделено в чате.")
-            return
-
-        first_line = selected.splitlines()[0].strip() if selected else ""
-        if not first_line:
-            first_line = "selected_text"
-
-        base_name = self._safe_filename(first_line, "selected_text")
-        default_ext = ".docx"
-
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=default_ext,
-            filetypes=[("Документ Word", "*.docx"), ("Все файлы", "*.*")],
-            initialfile=base_name + default_ext,
-            title="Сохранить выделенный текст как DOCX"
-        )
-        if not file_path:
-            return
-
-        doc = Document()
-        lines = selected.splitlines()
-
-        # Стек для отслеживания уровней маркированных списков
-        list_stack = []  # хранит уровень
-
-        def close_lists_up_to(level):
-            """Закрывает все списки, уровень которых >= level."""
-            nonlocal list_stack
-            while list_stack and list_stack[-1] >= level:
-                list_stack.pop()
-
-        def add_list_item(level, content):
-            """Добавляет элемент маркированного списка."""
-            nonlocal list_stack
-
-            close_lists_up_to(level)
-
-            p = doc.add_paragraph()
-
-            if level == 0:
-                p.style = 'List Bullet'
-            elif level == 1:
-                p.style = 'List Bullet 2'
-            elif level == 2:
-                p.style = 'List Bullet 3'
-            else:
-                p.style = 'List Bullet 4'
-
-            p.paragraph_format.left_indent = Inches(0.25 + level * 0.25)
-            self._apply_inline_formatting(p, content)
-            list_stack.append(level)
-
-        def add_regular_paragraph(text):
-            """Добавляет обычный параграф."""
-            nonlocal list_stack
-            list_stack = []
-
-            p = doc.add_paragraph()
-            p.paragraph_format.space_after = Pt(0)
-            self._apply_inline_formatting(p, text)
-
-        in_code_block = False
-        code_block_lines = []
-
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            i += 1
-
-            # Обработка кодовых блоков
-            if line.strip().startswith('```'):
-                if in_code_block:
-                    if code_block_lines:
-                        p = doc.add_paragraph()
-                        run = p.add_run('\n'.join(code_block_lines))
-                        run.font.name = 'Courier New'
-                        run.font.size = Pt(9)
-                        code_block_lines = []
-                    in_code_block = False
-                else:
-                    in_code_block = True
-                continue
-
-            if in_code_block:
-                code_block_lines.append(line)
-                continue
-
-            # Пропускаем пустые строки
-            if not line.strip():
-                doc.add_paragraph()
-                continue
-
-            # Проверяем, является ли строка элементом маркированного списка (-, *, •)
-            stripped = line.lstrip()
-            indent = len(line) - len(stripped)
-            level = indent // 4  # 4 пробела = 1 уровень
-
-            is_bullet = (
-                    stripped.startswith('- ') or
-                    stripped.startswith('* ') or
-                    stripped.startswith('• ')
-            )
-
-            if is_bullet:
-                content = stripped[2:].strip()
-                add_list_item(level, content)
-            else:
-                # Проверяем на заголовки
-                header_match = re.match(r'^(#+)\s+(.*)$', line)
-                if header_match:
-                    list_stack = []
-                    level = len(header_match.group(1))
-                    text = header_match.group(2)
-                    p = doc.add_paragraph()
-                    run = p.add_run(text)
-                    run.bold = True
-                    if level == 1:
-                        run.font.size = Pt(18)
-                        p.style = 'Heading 1'
-                    elif level == 2:
-                        run.font.size = Pt(16)
-                        p.style = 'Heading 2'
-                    elif level == 3:
-                        run.font.size = Pt(14)
-                        p.style = 'Heading 3'
-                    elif level >= 4:
-                        run.font.size = Pt(12)
-                        p.style = 'Heading 4'
-                else:
-                    # Проверяем на числовые списки и преобразуем их в обычный текст
-                    number_match = re.match(r'^(\d+)\.\s+(.*)$', stripped)
-                    if number_match:
-                        # Нумерованные списки преобразуем в обычный текст с номером
-                        content = number_match.group(2)
-                        p = doc.add_paragraph()
-                        p.paragraph_format.space_after = Pt(0)
-                        # Добавляем номер как обычный текст
-                        run = p.add_run(f"{number_match.group(1)}. ")
-                        run.bold = True
-                        self._apply_inline_formatting(p, content)
-                    else:
-                        add_regular_paragraph(line)
-
-        list_stack = []
-
-        try:
-            doc.save(file_path)
-            self.statusbar.config(text=f"Выделенный текст сохранён в DOCX: {file_path}")
-            self.add_system_message(f"📄 Выделенный текст сохранён в DOCX: {file_path}")
-        except Exception as e:
-            messagebox.showerror("Ошибка сохранения", f"Не удалось сохранить файл:\n{e}")
-
-    def _apply_inline_formatting(self, paragraph, text: str):
-        """
-        Применяет inline-форматирование к тексту в параграфе.
-        Поддерживает:
-        - **жирный** (или __жирный__)
-        - *курсив* (или _курсив_)
-        - `код`
-        """
-        import re
-
-        # Сначала обрабатываем **жирный** и __жирный__
-        parts = re.split(r'(\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_|`[^`]+`)', text)
-
-        for part in parts:
-            if not part:
-                continue
-
-            # Жирный: **текст** или __текст__
-            if (part.startswith('**') and part.endswith('**')):
-                run = paragraph.add_run(part[2:-2])
-                run.bold = True
-            elif (part.startswith('__') and part.endswith('__')):
-                run = paragraph.add_run(part[2:-2])
-                run.bold = True
-
-            # Курсив: *текст* или _текст_
-            elif (part.startswith('*') and part.endswith('*')):
-                run = paragraph.add_run(part[1:-1])
-                run.italic = True
-            elif (part.startswith('_') and part.endswith('_')):
-                run = paragraph.add_run(part[1:-1])
-                run.italic = True
-
-            # Код: `код`
-            elif part.startswith('`') and part.endswith('`'):
-                run = paragraph.add_run(part[1:-1])
-                run.font.name = 'Courier New'
-
-            # Обычный текст
-            else:
-                paragraph.add_run(part)
 
     # ---------- Построение пользовательского интерфейса ----------
     def init_ui(self):
@@ -501,6 +155,7 @@ class MainWindow(tb.Window):
         tools_menu.add_separator()
         tools_menu.add_command(label="Сохранить выделенное как файл", command=self._save_selected_as_file)
         tools_menu.add_command(label="Сохранить выделенное по разделам", command=self._save_selected_as_sections)
+        tools_menu.add_command(label="Сохранить выделенное как DOCX", command=self._save_selected_as_docx)
         tools_menu.add_separator()
         tools_menu.add_command(label="Очистить чат", command=self.clear_chat)
         tools_menu.add_command(label="Настройки", command=self.open_settings)
@@ -517,8 +172,8 @@ class MainWindow(tb.Window):
 
         export_menu = tb.Menu(commands_menu, tearoff=0)
         commands_menu.add_cascade(label="💾 Экспортировать результат", menu=export_menu)
-        for fmt, label in [("json", "JSON"), ("csv", "CSV"), ("md", "Markdown (MD)"), ("docx", "Word (DOCX)"),
-                           ("xlsx", "Excel (XLSX)")]:
+        for fmt, label in [("json", "JSON"), ("csv", "CSV"), ("md", "Markdown (MD)"),
+                           ("docx", "Word (DOCX)"), ("xlsx", "Excel (XLSX)")]:
             export_menu.add_command(label=label, command=lambda f=fmt: self._cmd_export_result(f))
 
         commands_menu.add_separator()
@@ -531,11 +186,11 @@ class MainWindow(tb.Window):
         menubar.add_cascade(label="Помощь", menu=help_menu)
         help_menu.add_command(label="О программе", command=self.show_about)
 
-        # ---- Статусная строка (САМАЯ ПЕРВАЯ упаковка, будет внизу) ----
+        # ---- Статусная строка (самая нижняя) ----
         self.statusbar = tb.Label(self, text="Готов", bootstyle="info", anchor=W)
         self.statusbar.pack(side=BOTTOM, fill=X)
 
-        # ---- Панель загрузки файлов (вторая упаковка, над статусной) ----
+        # ---- Панель загрузки файлов (над статусной) ----
         file_frame = Frame(self)
         file_frame.pack(fill=X, side=BOTTOM, padx=5, pady=2)
         file_frame.config(height=35)
@@ -558,95 +213,21 @@ class MainWindow(tb.Window):
         self.clear_file_btn = tb.Button(
             file_frame, text="✕ Убрать", bootstyle="danger",
             command=self.clear_file, state=DISABLED,
-            width=8
+            width=10
         )
         self.clear_file_btn.pack(side=RIGHT, padx=2)
 
-        # ---- Notebook с вкладками (занимает всё оставшееся пространство) ----
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=BOTH, expand=True, padx=0, pady=0)
-
-        # Вкладка "Чат"
-        self.chat_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.chat_frame, text="Чат")
+        # ---- Виджет чата (занимает всё оставшееся пространство) ----
+        self.chat_frame = ttk.Frame(self)
+        self.chat_frame.pack(fill=BOTH, expand=True, padx=0, pady=0)
         self.chat_widget = ChatWidget(self.chat_frame, self.on_user_message, self)
         self.chat_widget.pack(fill=BOTH, expand=True)
-
-        # Вкладка "Анализ документа"
-        self.analysis_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.analysis_frame, text="Анализ документа")
-        self._build_analysis_tab()
 
         # ---- Приветственное сообщение ----
         self.chat_widget.add_message("Приложение запущено. Введите вопрос.", "assistant")
 
-    def _build_analysis_tab(self):
-        """Строит интерфейс вкладки 'Анализ документа'"""
-        # Панель выбора документа
-        doc_frame = ttk.LabelFrame(self.analysis_frame, text="Документ", padding=5)
-        doc_frame.pack(fill=X, padx=5, pady=5)
-        self.doc_path_var = tb.StringVar()
-        self.doc_entry = tb.Entry(doc_frame, textvariable=self.doc_path_var, state="readonly")
-        self.doc_entry.pack(side=LEFT, fill=X, expand=True, padx=(0, 5))
-        tb.Button(doc_frame, text="Выбрать файл", bootstyle="secondary", command=self._select_document).pack(side=RIGHT)
-
-        # Панель выбора сценария
-        scenario_frame = ttk.LabelFrame(self.analysis_frame, text="Сценарий", padding=5)
-        scenario_frame.pack(fill=X, padx=5, pady=5)
-        self.scenario_path_var = tb.StringVar()
-        self.scenario_entry = tb.Entry(scenario_frame, textvariable=self.scenario_path_var, state="readonly")
-        self.scenario_entry.pack(side=LEFT, fill=X, expand=True, padx=(0, 5))
-        tb.Button(scenario_frame, text="Загрузить JSON", bootstyle="secondary", command=self._select_scenario).pack(side=RIGHT, padx=2)
-        tb.Button(scenario_frame, text="Редактор сценариев", bootstyle="info", command=self._open_scenario_editor).pack(side=RIGHT, padx=2)
-
-        # Кнопки управления
-        control_frame = ttk.Frame(self.analysis_frame)
-        control_frame.pack(fill=X, padx=5, pady=5)
-        self.analyze_btn = tb.Button(control_frame, text="Запустить анализ", bootstyle="success", command=self._start_analysis, state=DISABLED)
-        self.analyze_btn.pack(side=LEFT, padx=2)
-        self.cancel_btn = tb.Button(control_frame, text="Отменить", bootstyle="danger", command=self._cancel_analysis, state=DISABLED)
-        self.cancel_btn.pack(side=LEFT, padx=2)
-
-        # Прогресс
-        self.progress_var = tb.IntVar(value=0)
-        self.progress_bar = ttk.Progressbar(self.analysis_frame, variable=self.progress_var, mode='determinate')
-        self.progress_bar.pack(fill=X, padx=5, pady=5)
-
-        # Вкладки вывода
-        output_notebook = ttk.Notebook(self.analysis_frame)
-        output_notebook.pack(fill=BOTH, expand=True, padx=5, pady=5)
-
-        # Лог выполнения
-        log_frame = ttk.Frame(output_notebook)
-        output_notebook.add(log_frame, text="Лог выполнения")
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, wrap=WORD, state=DISABLED)
-        self.log_text.pack(fill=BOTH, expand=True)
-
-        # Результат анализа
-        result_frame = ttk.Frame(output_notebook)
-        output_notebook.add(result_frame, text="Результат анализа")
-        self.result_text = scrolledtext.ScrolledText(result_frame, height=10, wrap=WORD, state=DISABLED)
-        self.result_text.pack(fill=BOTH, expand=True)
-        btn_result_frame = ttk.Frame(result_frame)
-        btn_result_frame.pack(fill=X, pady=5)
-        tb.Button(btn_result_frame, text="Копировать результат", bootstyle="secondary", command=self._copy_result).pack(side=LEFT, padx=2)
-        tb.Button(btn_result_frame, text="Сохранить результат", bootstyle="secondary", command=self._save_result).pack(side=LEFT, padx=2)
-
-        # Промежуточные результаты
-        intermediate_frame = ttk.Frame(output_notebook)
-        output_notebook.add(intermediate_frame, text="Промежуточные результаты")
-        self.intermediate_combo = ttk.Combobox(intermediate_frame, state="readonly", width=30)
-        self.intermediate_combo.pack(fill=X, pady=(5, 5))
-        self.intermediate_combo.bind("<<ComboboxSelected>>", self._on_intermediate_selected)
-        self.intermediate_text = scrolledtext.ScrolledText(intermediate_frame, height=8, wrap=WORD, state=DISABLED)
-        self.intermediate_text.pack(fill=BOTH, expand=True)
-
-        self.analysis_thread = None
-        self.cancel_event = None
-
     # ---------- Сигналы и колбэки ----------
     def bind_signals(self):
-        """Подключает колбэки для ChatGPTClient"""
         self.chat_client.on_response = self._on_ai_response
         self.chat_client.on_chunk = self._on_ai_chunk
         self.chat_client.on_error = self._on_api_error
@@ -655,11 +236,6 @@ class MainWindow(tb.Window):
 
     # ---------- Обработчики событий чата ----------
     def on_user_message(self, text: str):
-        """
-        Основной обработчик сообщений пользователя:
-        - если команда (/...) – передаёт в _handle_command
-        - иначе формирует запрос к ChatGPT с учётом контекста и загруженных файлов
-        """
         if text.startswith('/'):
             self._handle_command(text)
             return
@@ -667,7 +243,6 @@ class MainWindow(tb.Window):
         self.chat_widget.add_message(text, "user")
         self.dialog_manager.add_message("user", text)
 
-        # Сбор контекста
         dialog_params = self.config_manager.get_dialog_params()
         history_pairs = dialog_params.get("history_pairs", 3)
         pairs = self.dialog_manager.get_conversation_pairs(history_pairs)
@@ -676,7 +251,6 @@ class MainWindow(tb.Window):
             history_text += f"Вопрос {i + 1}: {q}\nОтвет {i + 1}: {a}\n"
         summary = self.dialog_manager.current_dialog.get("summary", "")
 
-        # Содержимое загруженных файлов
         files_text = ""
         loaded_docs = self.dialog_manager.get_loaded_documents()
         for doc in loaded_docs:
@@ -685,7 +259,6 @@ class MainWindow(tb.Window):
             if not any(doc["filename"] == fname for doc in loaded_docs):
                 files_text += f"--- {fname} ---\n{content}\n"
 
-        # Загрузка промптов
         prompts = self.chat_client._load_prompts()
         system_prompt = prompts.get("dialog_system_prompt", "Ты полезный ассистент.")
         user_prompt_template = prompts.get(
@@ -702,7 +275,7 @@ class MainWindow(tb.Window):
             question=text
         )
 
-        # Проверка размера файла (рекомендация, если слишком большой)
+        # Проверка размера файла
         if files_text:
             import tiktoken
             try:
@@ -722,7 +295,6 @@ class MainWindow(tb.Window):
             except Exception as e:
                 self.logger.warning(f"Ошибка при оценке размера файла: {e}")
 
-        # Отправка запроса
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -730,7 +302,7 @@ class MainWindow(tb.Window):
         self._stream_buffer = ""
         self.chat_client.send_message(messages, stream=True)
 
-    # ---------- Обработка команд (/...) ----------
+    # ---------- Обработка команд ----------
     def _handle_command(self, text: str):
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower()
@@ -741,7 +313,7 @@ class MainWindow(tb.Window):
             "/load_document": lambda: self._cmd_load_document(args),
             "/load_scenario": lambda: self._cmd_load_scenario(args),
             "/run_scenario": self._cmd_run_scenario,
-            "/stop_scenario": self._cmd_stop_scenario,  # <-- добавить
+            "/stop_scenario": self._cmd_stop_scenario,
             "/export_result": lambda: self._cmd_export_result(args),
             "/import_folder": lambda: self._cmd_import_folder(args),
             "/clear_documents": self._cmd_clear_documents,
@@ -770,7 +342,6 @@ class MainWindow(tb.Window):
         self.dialog_manager.add_message("assistant", help_text)
 
     def _cmd_load_document(self, file_path: str):
-        """Загружает один или несколько документов (поддерживает пути с пробелами и разделители)"""
         if not file_path:
             self.chat_widget.add_message("❌ Укажите путь к файлу: /load_document <путь>", "assistant")
             return
@@ -778,7 +349,6 @@ class MainWindow(tb.Window):
         if os.path.isdir(file_path):
             self._cmd_import_folder(file_path)
             return
-        # Множественные пути через запятую или точку с запятой
         if ',' in file_path or ';' in file_path:
             separator = ',' if ',' in file_path else ';'
             paths = [p.strip().strip('"').strip("'") for p in file_path.split(separator) if p.strip()]
@@ -793,7 +363,6 @@ class MainWindow(tb.Window):
             if count > 0:
                 self.chat_widget.add_message(f"✅ Загружено {count} документов", "assistant")
             return
-        # Одиночный файл
         file_path = file_path.strip('"').strip("'")
         self._load_single_document(file_path)
 
@@ -811,9 +380,12 @@ class MainWindow(tb.Window):
                 self.chat_widget.add_message(f"✅ Документ '{filename}' загружен в контекст", "assistant")
                 self.dialog_manager.add_message("assistant", f"Документ '{filename}' загружен в контекст")
                 # Сохраняем конвертированный файл в папку сценария, если сценарий загружен
-                scenario_path = getattr(self, 'scenario_path_var', None)
-                if scenario_path and scenario_path.get():
-                    scenario_dir = Path(scenario_path.get()).parent
+                scenario_path = None
+                last_scenario = self.dialog_manager.get_last_scenario()
+                if last_scenario:
+                    scenario_path = last_scenario.get("path")
+                if scenario_path:
+                    scenario_dir = Path(scenario_path).parent
                     input_dir = scenario_dir / "input"
                     input_dir.mkdir(parents=True, exist_ok=True)
                     md_filename = Path(filename).stem + ".md"
@@ -898,12 +470,10 @@ class MainWindow(tb.Window):
                 stage_id = data.get("stage_id", "unknown")
                 formatted = data.get("formatted_content")
                 if formatted:
-                    self.after(0, lambda: self._append_chat_message(
-                        f"*Система*: Результат этапа '{stage_id}':\n{formatted}"))
+                    self.after(0, lambda: self._append_chat_message(f"*Система*: Результат этапа '{stage_id}':\n{formatted}"))
                 else:
                     full_result = data.get("full_result", "")
-                    self.after(0, lambda: self._append_chat_message(
-                        f"*Система*: Результат этапа '{stage_id}':\n{full_result}"))
+                    self.after(0, lambda: self._append_chat_message(f"*Система*: Результат этапа '{stage_id}':\n{full_result}"))
 
         try:
             result = run_analysis(
@@ -913,7 +483,6 @@ class MainWindow(tb.Window):
                 progress_callback=chat_callback,
                 cancel_event=self.cancel_event
             )
-            # result должен быть словарём с ключом 'status'
             self.after(0, lambda: self._on_scenario_finished(result))
         except Exception as e:
             self.after(0, lambda: self._append_chat_message(f"❌ Критическая ошибка: {e}"))
@@ -923,40 +492,27 @@ class MainWindow(tb.Window):
         self.dialog_manager.add_message("assistant", text)
 
     def _on_scenario_finished(self, result):
-        """Обрабатывает завершение выполнения сценария."""
-        # Защита от пустого результата
         if result is None:
             self._append_chat_message("❌ Ошибка: результат анализа пустой")
             self.analysis_thread = None
             return
-
-        # Защита от отсутствия ключа 'status'
         if not isinstance(result, dict):
             self._append_chat_message(f"❌ Ошибка: неверный формат результата: {result}")
             self.analysis_thread = None
             return
-
         status = result.get("status")
-
         if status == "success":
             self.dialog_manager.set_last_result(result["result"], result.get("format", "text"))
             self._append_chat_message(f"✅ Анализ завершён успешно! Результат в формате {result.get('format', 'text')}")
-            # Показываем результат в чате (если не слишком большой)
-            result_text = result.get("result", "")
-            self._append_chat_message(f"**Результат:**\n{result_text}")
+            self._append_chat_message(f"**Результат:**\n{result.get('result', '')}")
         elif status == "cancelled":
             self._append_chat_message("⚠️ Анализ отменён пользователем")
         else:
             error_msg = result.get("message", "Неизвестная ошибка")
             self._append_chat_message(f"❌ Ошибка: {error_msg}")
-
         self.analysis_thread = None
 
     def add_system_message(self, text: str):
-        """
-        Добавляет системное сообщение в чат без отправки в GPT.
-        Используется для уведомлений о загрузке/сохранении промптов и других системных событиях.
-        """
         self.chat_widget.add_message(f"*Система*: {text}", "assistant")
         self.dialog_manager.add_message("assistant", f"*Система*: {text}")
 
@@ -967,8 +523,7 @@ class MainWindow(tb.Window):
         format_type = format_type.strip().lower()
         valid = {"json", "csv", "md", "docx", "xlsx"}
         if format_type not in valid:
-            self.chat_widget.add_message(f"❌ Неподдерживаемый формат: {format_type}. Доступные: {', '.join(valid)}",
-                                         "assistant")
+            self.chat_widget.add_message(f"❌ Неподдерживаемый формат: {format_type}. Доступные: {', '.join(valid)}", "assistant")
             return
         result = self.dialog_manager.get_last_result()
         if not result:
@@ -988,9 +543,11 @@ class MainWindow(tb.Window):
             ext = Path(file_path).suffix.lower()
             content = result["result"]
             if ext == '.docx':
-                self._save_as_docx(file_path, content, result.get("format", "text"))
+                doc = self._save_as_docx(content, result.get("format", "text"))
+                doc.save(file_path)
             elif ext == '.xlsx':
-                self._save_as_xlsx(file_path, content, result.get("format", "text"))
+                wb = self._save_as_xlsx(content, result.get("format", "text"))
+                wb.save(file_path)
             elif ext == '.json':
                 try:
                     data = json.loads(content)
@@ -1054,7 +611,6 @@ class MainWindow(tb.Window):
         self.dialog_manager.add_message("assistant", "Загруженные сценарии очищены")
 
     def _cmd_stop_scenario(self):
-        """Останавливает выполняющийся сценарий (если есть)."""
         if self.analysis_thread and self.analysis_thread.is_alive():
             if self.cancel_event:
                 self.cancel_event.set()
@@ -1095,7 +651,7 @@ class MainWindow(tb.Window):
         if folder_path:
             self._cmd_import_folder(folder_path)
 
-    # ---------- Загрузка/сохранение промптов (глобальные) ----------
+    # ---------- Загрузка/сохранение промптов ----------
     def _load_prompt_global(self):
         self.chat_widget._load_prompt_from_dialog()
 
@@ -1115,9 +671,8 @@ class MainWindow(tb.Window):
             except Exception as e:
                 self.logger.error(f"Ошибка автозагрузки промпта: {e}")
 
-    # ---------- Работа с файлами (прикрепление, очистка, метки) ----------
+    # ---------- Работа с файлами ----------
     def load_file(self):
-        """Загружает файл через диалог и добавляет его в контекст чата"""
         result = FileLoader.load_from_dialog(self, self.config_manager)
         if result:
             filename, content, file_format = result
@@ -1150,7 +705,6 @@ class MainWindow(tb.Window):
     def _update_file_label(self):
         if self.attached_files:
             names = ", ".join(f[0] for f in self.attached_files)
-            # Обрезаем длинные имена для отображения
             if len(names) > 60:
                 names = names[:57] + "..."
             self.file_label.config(text=f"📎 Файлы: {names}")
@@ -1185,7 +739,7 @@ class MainWindow(tb.Window):
             self.logger.error(f"Ошибка сохранения конвертированного файла: {e}")
             return None
 
-    # ---------- Работа с диалогами (сохранение/загрузка/очистка) ----------
+    # ---------- Работа с диалогами ----------
     def new_dialog(self):
         if self.dialog_manager.current_dialog["messages"]:
             reply = messagebox.askyesno("Новый диалог", "Текущий диалог будет потерян. Продолжить?")
@@ -1254,877 +808,16 @@ class MainWindow(tb.Window):
         self.chat_widget.add_message(f"*Система*: Обобщение диалога:\n{summary}", "assistant")
         self.statusbar.config(text="Summary готов")
 
-    # ---------- Интерфейс вкладки "Анализ документа" ----------
-    def _select_document(self):
-        file_paths = filedialog.askopenfilenames(
-            title="Выберите один или несколько документов",
-            filetypes=[
-                ("Поддерживаемые", "*.docx *.xlsx *.pdf *.xls *.txt *.md"),
-                ("Документы Word", "*.docx"),
-                ("Таблицы Excel", "*.xlsx *.xls"),
-                ("PDF", "*.pdf"),
-                ("Текстовые", "*.txt *.md"),
-                ("Все файлы", "*.*")
-            ]
-        )
-        if file_paths:
-            self.doc_paths_var = list(file_paths)
-            self.doc_path_var.set("")
-            self.doc_entry.config(state=NORMAL)
-            self.doc_entry.delete(0, END)
-            self.doc_entry.insert(0, f"Выбрано {len(file_paths)} файлов")
-            self.doc_entry.config(state="readonly")
-            self._update_analyze_button_state()
-
-    def _select_scenario(self):
-        file_path = filedialog.askopenfilename(
-            title="Выберите JSON-сценарий",
-            filetypes=[("JSON files", "*.json")]
-        )
-        if file_path:
-            self.scenario_path_var.set(file_path)
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if 'stages' not in data:
-                        raise ValueError("Нет ключа 'stages'")
-                self._update_analyze_button_state()
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Невалидный сценарий:\n{e}")
-                self.scenario_path_var.set("")
-
-    def _update_analyze_button_state(self):
-        enabled = bool(self.doc_path_var.get() and self.scenario_path_var.get())
-        self.analyze_btn.config(state=NORMAL if enabled else DISABLED)
-
-    def _open_scenario_editor(self):
-        launch_scenario_editor(self, self.config_manager)
-
-    def _start_analysis(self):
-        if self.analysis_thread and self.analysis_thread.is_alive():
-            messagebox.showwarning("Анализ", "Анализ уже выполняется")
-            return
-        # Определяем список файлов
-        if hasattr(self, 'doc_paths_var') and self.doc_paths_var:
-            doc_paths = self.doc_paths_var
-        else:
-            doc_path = self.doc_path_var.get()
-            if doc_path:
-                doc_paths = [doc_path]
-            else:
-                doc_paths = []
-        if not doc_paths:
-            messagebox.showwarning("Анализ", "Выберите документ(ы) для анализа")
-            return
-        scenario_path = self.scenario_path_var.get()
-        if not scenario_path:
-            messagebox.showwarning("Анализ", "Выберите сценарий")
-            return
-        self.analyze_btn.config(state=DISABLED)
-        self.cancel_btn.config(state=NORMAL)
-        self.progress_var.set(0)
-        self.log_text.config(state=NORMAL)
-        self.log_text.delete("1.0", END)
-        self.log_text.insert(END, "Начало анализа...\n")
-        self.log_text.config(state=DISABLED)
-        self.result_text.config(state=NORMAL)
-        self.result_text.delete("1.0", END)
-        self.result_text.config(state=DISABLED)
-        self._intermediate_results = {}
-        self.intermediate_combo['values'] = []
-        self.intermediate_combo.set("")
-        self.intermediate_text.config(state=NORMAL)
-        self.intermediate_text.delete("1.0", END)
-        self.intermediate_text.config(state=DISABLED)
-        api_key = self.config_manager.get_api_key()
-        if not api_key:
-            self._append_log("❌ API ключ не найден. Задайте его в настройках.")
-            self._end_analysis(False)
-            return
-        llm_params = self.config_manager.get_llm_params()
-        api_settings = {
-            "api_key": api_key,
-            "model": llm_params.get("model", "gpt-4o-mini"),
-            "temperature": llm_params.get("temperature", 0.2),
-            "max_tokens": llm_params.get("max_tokens", 2000),
-            "timeout": llm_params.get("timeout", 60)
-        }
-        self.cancel_event = threading.Event()
-        self.analysis_thread = threading.Thread(
-            target=self._run_analysis_thread,
-            args=(doc_paths, scenario_path, api_settings),
-            daemon=True
-        )
-        self.analysis_thread.start()
-
-    def _run_analysis_thread(self, doc_paths, scenario_path, api_settings):
-        def progress_callback(msg_type, data):
-            self.after(0, lambda: self._handle_progress(msg_type, data))
-
-        try:
-            result = run_analysis(
-                document_paths=doc_paths,  # теперь список
-                scenario_path=scenario_path,
-                api_settings=api_settings,
-                progress_callback=progress_callback,
-                cancel_event=self.cancel_event
-            )
-            self.after(0, lambda: self._on_analysis_finished(result))
-        except Exception as e:
-            self.after(0, lambda: self._on_analysis_error(str(e)))
-
-    def _handle_progress(self, msg_type, data):
-        if msg_type == "log":
-            self._append_log(data)
-        elif msg_type == "stage":
-            self._update_progress(data["current"], data["total"], data["name"])
-        elif msg_type == "stage_result":
-            stage_id = data.get("stage_id", "unknown")
-            # Используем formatted_content, если он есть, иначе full_result
-            formatted = data.get("formatted_content")
-            if formatted:
-                preview = formatted[:500] + ("..." if len(formatted) > 500 else "")
-                self._append_log(f"--- Результат этапа '{stage_id}': ---")
-                self._append_log(preview)
-                self._append_log("---")
-                self._intermediate_results[stage_id] = formatted
-            else:
-                preview = data.get("result_preview", "")
-                self._append_log(f"--- Результат этапа '{stage_id}': ---")
-                self._append_log(preview)
-                self._append_log("---")
-                self._intermediate_results[stage_id] = data.get("full_result", preview)
-            self.after(0, self._update_intermediate_combo)
-
-    def _update_progress(self, current, total, stage_name):
-        percent = int((current / total) * 100)
-        self.progress_var.set(percent)
-        self._append_log(f"Этап {current}/{total}: {stage_name}")
-
-    def _append_log(self, message):
-        self.log_text.config(state=NORMAL)
-        self.log_text.insert(END, f"{message}\n")
-        self.log_text.see(END)
-        self.log_text.config(state=DISABLED)
-
-    def _on_analysis_finished(self, result):
-        self._end_analysis(True)
-        if result["status"] == "success":
-            self._append_log("✅ Анализ завершён успешно")
-            self._show_result(result["result"], result.get("format", "text"))
-        elif result["status"] == "cancelled":
-            self._append_log("⚠️ Анализ отменён пользователем")
-        else:
-            self._append_log(f"❌ Ошибка: {result.get('message', 'Неизвестная ошибка')}")
-
-    def _on_analysis_error(self, error_msg):
-        self._end_analysis(False)
-        self._append_log(f"❌ Критическая ошибка: {error_msg}")
-
-    def _end_analysis(self, success):
-        self.after(0, lambda: self.analyze_btn.config(
-            state=NORMAL if self.doc_path_var.get() and self.scenario_path_var.get() else DISABLED))
-        self.after(0, lambda: self.cancel_btn.config(state=DISABLED))
-        self.analysis_thread = None
-        self.cancel_event = None
-
-    def _cancel_analysis(self):
-        if self.cancel_event:
-            self.cancel_event.set()
-            self._append_log("Отмена анализа...")
-
-    def _show_result(self, text, fmt):
-        self.result_text.config(state=NORMAL)
-        self.result_text.delete("1.0", END)
-        self.result_text.insert(END, text)
-        self.result_text.config(state=DISABLED)
-        self.result_format = fmt
-
-    def _copy_result(self):
-        text = self.result_text.get("1.0", END).strip()
-        if text:
-            self.clipboard_clear()
-            self.clipboard_append(text)
-            self.statusbar.config(text="Результат скопирован в буфер обмена")
-
-    def _save_result(self):
-        text = self.result_text.get("1.0", END).strip()
-        if not text:
-            return
-        fmt = getattr(self, 'result_format', 'text')
-
-        filetypes = [
-            ("Текстовый файл", "*.txt"),
-            ("Markdown", "*.md"),
-            ("JSON", "*.json"),
-            ("CSV", "*.csv"),
-            ("Документ Word", "*.docx"),
-            ("Таблица Excel", "*.xlsx")
-        ]
-        file_path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=filetypes)
-        if not file_path:
-            return
-
-        ext = Path(file_path).suffix.lower()
-        try:
-            if ext == '.docx':
-                self._save_as_docx(file_path, text, fmt)
-            elif ext == '.xlsx':
-                self._save_as_xlsx(file_path, text, fmt)
-            elif ext == '.json':
-                # Сохраняем JSON с корректной кодировкой
-                try:
-                    data = json.loads(text)
-                    with open(file_path, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
-                except json.JSONDecodeError:
-                    with open(file_path, 'w', encoding='utf-8') as f:
-                        f.write(text)
-                self.statusbar.config(text=f"Результат сохранён: {file_path}")
-            else:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(text)
-                self.statusbar.config(text=f"Результат сохранён: {file_path}")
-        except Exception as e:
-            messagebox.showerror("Ошибка сохранения", f"Не удалось сохранить файл:\n{e}")
-            self.logger.error(f"Ошибка сохранения: {e}")
-
-    def _on_intermediate_selected(self, event):
-        stage_id = self.intermediate_combo.get()
-        if hasattr(self, '_intermediate_results') and stage_id in self._intermediate_results:
-            self.intermediate_text.config(state=NORMAL)
-            self.intermediate_text.delete("1.0", END)
-            self.intermediate_text.insert(END, self._intermediate_results[stage_id])
-            self.intermediate_text.config(state=DISABLED)
-
-    def _update_intermediate_combo(self):
-        if hasattr(self, '_intermediate_results'):
-            stages = list(self._intermediate_results.keys())
-            current = self.intermediate_combo.get()
-            self.intermediate_combo['values'] = stages
-            if current in stages:
-                self.intermediate_combo.set(current)
-            elif stages:
-                self.intermediate_combo.set(stages[-1])
-                self._on_intermediate_selected(None)
-
-    # ---------- Сохранение в DOCX и XLSX (для результатов и чата) ----------
-    def _parse_markdown_table(self, table_lines):
-        lines = [line.strip() for line in table_lines if line.strip()]
-        if len(lines) < 2:
-            return None
-        header_line = lines[0]
-        sep_line = lines[1] if len(lines) > 1 else None
-        if not sep_line or '---' not in sep_line:
-            data_rows = lines
-            headers = []
-        else:
-            headers = [cell.strip() for cell in header_line.split('|') if cell.strip()]
-            data_rows = lines[2:]
-        table = []
-        if headers:
-            table.append(headers)
-        for row_line in data_rows:
-            cells = [cell.strip() for cell in row_line.split('|') if cell.strip()]
-            if len(cells) < len(headers):
-                cells.extend([''] * (len(headers) - len(cells)))
-            table.append(cells[:len(headers)])
-        return table
-
-    def _convert_csv_to_table(self, text: str) -> list:
-        """
-        Преобразует CSV-текст (строки с разделителями) в список списков для таблицы.
-        Определяет разделитель автоматически (запятая, табуляция, точка с запятой).
-        """
-        if not text:
-            return None
-
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-        if len(lines) < 2:
-            return None
-
-        # Определяем разделитель
-        separators = [',', '\t', ';', '|']
-        best_sep = None
-        best_count = 0
-
-        for sep in separators:
-            count = sum(line.count(sep) for line in lines)
-            if count > best_count:
-                best_count = count
-                best_sep = sep
-
-        if best_sep is None or best_count < 2:
-            return None
-
-        table = []
-        for line in lines:
-            # Разбиваем строку, учитывая кавычки
-            if best_sep == ',':
-                import csv
-                import io
-                reader = csv.reader(io.StringIO(line))
-                row = next(reader)
-            else:
-                row = [cell.strip() for cell in line.split(best_sep)]
-            table.append(row)
-
-        return table
-
-    def _is_likely_csv(self, text: str) -> bool:
-        """Определяет, похож ли текст на CSV."""
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-        if len(lines) < 2:
-            return False
-
-        # Проверяем наличие разделителей в большинстве строк
-        separators = [',', '\t', ';', '|']
-        for sep in separators:
-            count = sum(1 for line in lines if sep in line)
-            if count >= len(lines) * 0.5:  # хотя бы 50% строк содержат разделитель
-                return True
-        return False
-
-    def _convert_csv_block_to_table(self, csv_text: str) -> list:
-        """
-        Преобразует CSV-текст (с кавычками) в список списков для таблицы.
-        """
-        if not csv_text:
-            return None
-
-        import csv
-        import io
-
-        lines = csv_text.strip().split('\n')
-        if len(lines) < 2:
-            return None
-
-        try:
-            # Пробуем прочитать как CSV с кавычками
-            reader = csv.reader(io.StringIO(csv_text))
-            table = list(reader)
-            if table and len(table) > 0 and len(table[0]) > 0:
-                return table
-        except:
-            pass
-
-        # Если не удалось, пробуем другие разделители
-        separators = ['\t', ';', '|']
-        for sep in separators:
-            try:
-                table = [line.split(sep) for line in lines]
-                if table and len(table) > 0 and len(table[0]) > 1:
-                    return table
-            except:
-                continue
-
-        return None
-
-    def _save_as_docx(self, file_path: str, content: str, fmt: str):
-        """Сохраняет результат в формате DOCX с поддержкой заголовков, жирного/курсива и CSV-блоков."""
-        from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-        import re
-        import csv
-        import io
-
-        doc = Document()
-
-        if fmt == 'markdown':
-            lines = content.split('\n')
-            in_table = False
-            table_lines = []
-            in_code_block = False
-            code_block_lines = []
-            code_block_lang = ''
-            csv_buffer = []
-            in_csv = False
-
-            def flush_csv():
-                nonlocal csv_buffer, in_csv
-                if csv_buffer:
-                    table = self._convert_csv_block_to_table('\n'.join(csv_buffer))
-                    if table and len(table) > 0 and len(table[0]) > 0:
-                        word_table = doc.add_table(rows=len(table), cols=len(table[0]))
-                        word_table.style = 'Table Grid'
-                        for r, row_data in enumerate(table):
-                            for c, cell_text in enumerate(row_data):
-                                if c < len(row_data):
-                                    word_table.cell(r, c).text = cell_text
-                    else:
-                        p = doc.add_paragraph()
-                        run = p.add_run('\n'.join(csv_buffer))
-                        run.font.name = 'Courier New'
-                        run.font.size = Pt(9)
-                    csv_buffer = []
-                    in_csv = False
-
-            def add_paragraph_with_markdown(text: str):
-                p = doc.add_paragraph()
-                parts = re.split(r'(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)', text)
-                for part in parts:
-                    if not part:
-                        continue
-                    if part.startswith('**') and part.endswith('**'):
-                        run = p.add_run(part[2:-2])
-                        run.bold = True
-                    elif part.startswith('*') and part.endswith('*'):
-                        run = p.add_run(part[1:-1])
-                        run.italic = True
-                    elif part.startswith('`') and part.endswith('`'):
-                        run = p.add_run(part[1:-1])
-                        run.font.name = 'Courier New'
-                    else:
-                        p.add_run(part)
-
-            for line in lines:
-                # Пропускаем пустые строки, но не в CSV и не в коде
-                if not line:
-                    if in_code_block:
-                        code_block_lines.append('')
-                    elif in_csv:
-                        csv_buffer.append('')
-                    else:
-                        doc.add_paragraph()
-                    continue
-
-                # ---- Обработка кодовых блоков ----
-                if line.startswith('```'):
-                    flush_csv()
-                    if in_code_block:
-                        # Закрываем блок
-                        if code_block_lines:
-                            block_text = '\n'.join(code_block_lines)
-                            if code_block_lang == 'csv':
-                                table = self._convert_csv_block_to_table(block_text)
-                                if table and len(table) > 0 and len(table[0]) > 0:
-                                    word_table = doc.add_table(rows=len(table), cols=len(table[0]))
-                                    word_table.style = 'Table Grid'
-                                    for r, row_data in enumerate(table):
-                                        for c, cell_text in enumerate(row_data):
-                                            if c < len(row_data):
-                                                word_table.cell(r, c).text = cell_text
-                                else:
-                                    p = doc.add_paragraph()
-                                    run = p.add_run(block_text)
-                                    run.font.name = 'Courier New'
-                                    run.font.size = Pt(9)
-                            else:
-                                p = doc.add_paragraph()
-                                run = p.add_run(block_text)
-                                run.font.name = 'Courier New'
-                                run.font.size = Pt(9)
-                            code_block_lines = []
-                            code_block_lang = ''
-                        in_code_block = False
-                    else:
-                        in_code_block = True
-                        code_block_lang = line[3:].strip().lower()
-                    continue
-
-                if in_code_block:
-                    code_block_lines.append(line)
-                    continue
-
-                # ---- Проверка на CSV (если строка похожа на CSV и не является заголовком) ----
-                if not line.startswith('#') and '|' not in line and self._is_likely_csv(line):
-                    if not in_csv:
-                        flush_csv()
-                        in_csv = True
-                    csv_buffer.append(line)
-                    continue
-                elif in_csv:
-                    flush_csv()
-
-                # ---- Обработка Markdown-таблиц ----
-                if '|' in line and not line.strip().startswith('|'):
-                    if not in_table:
-                        in_table = True
-                    table_lines.append(line)
-                else:
-                    if in_table:
-                        if table_lines:
-                            table = self._parse_markdown_table(table_lines)
-                            if table and len(table) > 0 and len(table[0]) > 0:
-                                word_table = doc.add_table(rows=len(table), cols=len(table[0]))
-                                word_table.style = 'Table Grid'
-                                for r, row_data in enumerate(table):
-                                    for c, cell_text in enumerate(row_data):
-                                        if c < len(row_data):
-                                            word_table.cell(r, c).text = cell_text
-                        table_lines = []
-                        in_table = False
-
-                    # ---- Обработка заголовков Markdown ----
-                    header_match = re.match(r'^(#+)\s+(.*)$', line)
-                    if header_match:
-                        level = len(header_match.group(1))
-                        text = header_match.group(2).strip()
-                        # Удаляем ** если они есть (чтобы не дублировать жирность)
-                        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
-                        p = doc.add_paragraph()
-                        run = p.add_run(text)
-                        run.bold = True
-                        if level == 1:
-                            run.font.size = Pt(18)
-                            p.style = 'Heading 1'
-                        elif level == 2:
-                            run.font.size = Pt(16)
-                            p.style = 'Heading 2'
-                        elif level == 3:
-                            run.font.size = Pt(14)
-                            p.style = 'Heading 3'
-                        elif level >= 4:
-                            run.font.size = Pt(12)
-                            p.style = 'Heading 4'
-                        continue
-
-                    # ---- Обычный текст с Markdown ----
-                    add_paragraph_with_markdown(line)
-
-            # ---- Обработка остатков ----
-            flush_csv()
-            if in_table and table_lines:
-                table = self._parse_markdown_table(table_lines)
-                if table and len(table) > 0 and len(table[0]) > 0:
-                    word_table = doc.add_table(rows=len(table), cols=len(table[0]))
-                    word_table.style = 'Table Grid'
-                    for r, row_data in enumerate(table):
-                        for c, cell_text in enumerate(row_data):
-                            if c < len(row_data):
-                                word_table.cell(r, c).text = cell_text
-
-        elif fmt == 'json':
-            try:
-                # Проверяем, является ли содержимое валидным JSON
-                if isinstance(content, str):
-                    data = json.loads(content)
-                else:
-                    data = content
-
-                # Если JSON — массив объектов, создаём таблицу
-                if isinstance(data, list) and data and all(isinstance(item, dict) for item in data):
-                    self._json_to_word_table(doc, data)
-                # Если JSON — объект, создаём таблицу ключ-значение
-                elif isinstance(data, dict):
-                    self._json_to_word_table(doc, data)
-                else:
-                    # Иначе — вставляем как код с правильной кодировкой
-                    p = doc.add_paragraph()
-                    run = p.add_run(json.dumps(data, ensure_ascii=False, indent=2))
-                    run.font.name = 'Courier New'
-                    run.font.size = Pt(10)
-            except (json.JSONDecodeError, TypeError) as e:
-                self.logger.warning(f"Не удалось распарсить JSON: {e}")
-                # Вставляем как текст с правильной кодировкой
-                p = doc.add_paragraph()
-                run = p.add_run(content)
-                run.font.name = 'Courier New'
-                run.font.size = Pt(10)
-        else:
-            # CSV, text – вставляем моноширинным шрифтом
-            p = doc.add_paragraph()
-            run = p.add_run(content)
-            run.font.name = 'Courier New'
-            run.font.size = Pt(10)
-
-        doc.save(file_path)
-        self.statusbar.config(text=f"Результат сохранён в DOCX: {file_path}")
-
-    def _save_as_xlsx(self, file_path: str, content: str, fmt: str):
-        wb = Workbook()
-        if fmt in ('json', 'csv'):
-            try:
-                if fmt == 'json':
-                    data = json.loads(content)
-                    # Если данные — это словарь с ключом 'systems', извлекаем массив
-                    if isinstance(data, dict) and 'systems' in data:
-                        data = data['systems']
-                    if isinstance(data, list):
-                        df = pd.DataFrame(data)
-                    else:
-                        df = pd.DataFrame([data])
-                else:  # csv
-                    df = pd.read_csv(io.StringIO(content))
-                with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Data')
-                self.statusbar.config(text=f"Результат сохранён в XLSX: {file_path}")
-                return
-            except Exception as e:
-                self.logger.warning(f"Не удалось преобразовать в таблицу: {e}")
-                # Продолжаем как обычный текст
-
-        if fmt == 'markdown':
-            lines = content.split('\n')
-            table_lines = []
-            in_table = False
-            text_parts = []
-            tables = []
-            for line in lines:
-                if '|' in line and not line.strip().startswith('|'):
-                    if not in_table:
-                        in_table = True
-                    table_lines.append(line)
-                else:
-                    if in_table:
-                        if table_lines:
-                            table = self._parse_markdown_table(table_lines)
-                            if table:
-                                tables.append(table)
-                        table_lines = []
-                        in_table = False
-                        text_parts.append(line)
-                    else:
-                        text_parts.append(line)
-            if table_lines:
-                table = self._parse_markdown_table(table_lines)
-                if table:
-                    tables.append(table)
-
-            if text_parts:
-                ws_text = wb.active
-                ws_text.title = "Text"
-                ws_text.cell(row=1, column=1, value='\n'.join(text_parts))
-
-            if tables:
-                ws_table = wb.create_sheet("Tables")
-                start_row = 1
-                for table in tables:
-                    for row_data in table:
-                        for col_idx, cell_value in enumerate(row_data, 1):
-                            ws_table.cell(row=start_row, column=col_idx, value=cell_value)
-                        start_row += 1
-                    start_row += 1
-        else:
-            ws = wb.active
-            ws.cell(row=1, column=1, value=content)
-
-        wb.save(file_path)
-        self.statusbar.config(text=f"Результат сохранён в XLSX: {file_path}")
-
-    def _json_to_word_table(self, doc, data):
-        """Преобразует JSON-данные в таблицу Word с корректной обработкой длинных строк."""
-        from docx.shared import Inches
-
-        if isinstance(data, list) and data and all(isinstance(item, dict) for item in data):
-            headers = list(data[0].keys())
-            table = doc.add_table(rows=1 + len(data), cols=len(headers))
-            table.style = 'Table Grid'
-            # Заголовки
-            for col_idx, header in enumerate(headers):
-                cell = table.cell(0, col_idx)
-                cell.text = header
-                # Жирный шрифт для заголовков
-                for paragraph in cell.paragraphs:
-                    for run in paragraph.runs:
-                        run.bold = True
-            # Данные
-            for row_idx, item in enumerate(data, 1):
-                for col_idx, key in enumerate(headers):
-                    val = item.get(key, '')
-                    if isinstance(val, (list, dict)):
-                        val = json.dumps(val, ensure_ascii=False)
-                    cell = table.cell(row_idx, col_idx)
-                    cell.text = str(val)
-                    # Автоподбор ширины столбцов
-                    cell.width = None
-        elif isinstance(data, dict):
-            table = doc.add_table(rows=len(data), cols=2)
-            table.style = 'Table Grid'
-            for row_idx, (key, val) in enumerate(data.items()):
-                table.cell(row_idx, 0).text = str(key)
-                if isinstance(val, (list, dict)):
-                    val = json.dumps(val, ensure_ascii=False)
-                table.cell(row_idx, 1).text = str(val)
-        else:
-            p = doc.add_paragraph()
-            run = p.add_run(json.dumps(data, ensure_ascii=False))
-            run.font.name = 'Courier New'
-            run.font.size = Pt(10)
-
+    # ---------- Сохранение чата в DOCX ----------
     def _save_chat_as_docx_wrapper(self):
         chat_text = self.chat_widget.get_chat_text()
         if not chat_text:
             messagebox.showwarning("Сохранение", "Чат пуст, нечего сохранять")
             return
-        self._save_chat_as_docx(chat_text)
-
-    def _save_chat_as_docx(self, chat_text: str):
-        """Сохраняет содержимое чата в DOCX с поддержкой Markdown-разметки, заголовков и CSV-таблиц."""
-        from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-
-        doc = Document()
-
-        # Парсим текст чата построчно
-        lines = chat_text.split('\n')
-        in_code_block = False
-        code_block_lines = []
-        code_block_lang = ''
-        csv_buffer = []
-        in_csv = False
-
-        def flush_csv():
-            nonlocal csv_buffer, in_csv
-            if csv_buffer:
-                table = self._convert_csv_to_table('\n'.join(csv_buffer))
-                if table and len(table) > 0 and len(table[0]) > 0:
-                    word_table = doc.add_table(rows=len(table), cols=len(table[0]))
-                    word_table.style = 'Table Grid'
-                    for i, row_data in enumerate(table):
-                        for j, cell_text in enumerate(row_data):
-                            if j < len(row_data):
-                                word_table.cell(i, j).text = cell_text
-                else:
-                    # Если не удалось преобразовать в таблицу, вставляем как текст
-                    p = doc.add_paragraph()
-                    run = p.add_run('\n'.join(csv_buffer))
-                    run.font.name = 'Courier New'
-                    run.font.size = Pt(9)
-                csv_buffer = []
-                in_csv = False
-
-        def add_paragraph_with_markdown(text: str):
-            """Добавляет параграф с обработкой Markdown-разметки (жирный, курсив, код)."""
-            p = doc.add_paragraph()
-            parts = re.split(r'(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)', text)
-            for part in parts:
-                if not part:
-                    continue
-                if part.startswith('**') and part.endswith('**'):
-                    run = p.add_run(part[2:-2])
-                    run.bold = True
-                elif part.startswith('*') and part.endswith('*'):
-                    run = p.add_run(part[1:-1])
-                    run.italic = True
-                elif part.startswith('`') and part.endswith('`'):
-                    run = p.add_run(part[1:-1])
-                    run.font.name = 'Courier New'
-                else:
-                    p.add_run(part)
-
-        i = 0
-        while i < len(lines):
-            line = lines[i].rstrip()
-            i += 1
-
-            # Пропускаем пустые строки (но не в CSV-блоке)
-            if not line:
-                if in_csv:
-                    csv_buffer.append('')
-                else:
-                    doc.add_paragraph()
-                continue
-
-            # Пропускаем разделители (---)
-            if line.startswith('---') and line.endswith('---'):
-                continue
-
-            # Обработка маркеров чата (Вы, Ассистент, Система)
-            if line.startswith('Вы  ') or line.startswith('Ассистент  ') or line.startswith('*Система*'):
-                flush_csv()
-                p = doc.add_paragraph()
-                run = p.add_run(line)
-                run.bold = True
-                run.font.size = Pt(10)
-                continue
-
-            # Обработка кодовых блоков
-            if line.startswith('```'):
-                flush_csv()
-                if in_code_block:
-                    # Закрываем блок
-                    if code_block_lines:
-                        # Проверяем, является ли блок CSV
-                        block_text = '\n'.join(code_block_lines)
-                        if code_block_lang == 'csv':
-                            table = self._convert_csv_block_to_table(block_text)
-                            if table and len(table) > 0 and len(table[0]) > 0:
-                                word_table = doc.add_table(rows=len(table), cols=len(table[0]))
-                                word_table.style = 'Table Grid'
-                                for r, row_data in enumerate(table):
-                                    for c, cell_text in enumerate(row_data):
-                                        if c < len(row_data):
-                                            word_table.cell(r, c).text = cell_text
-                            else:
-                                # Если не удалось преобразовать в таблицу, вставляем как код
-                                p = doc.add_paragraph()
-                                run = p.add_run(block_text)
-                                run.font.name = 'Courier New'
-                                run.font.size = Pt(9)
-                        else:
-                            p = doc.add_paragraph()
-                            run = p.add_run(block_text)
-                            run.font.name = 'Courier New'
-                            run.font.size = Pt(9)
-                        code_block_lines = []
-                        code_block_lang = ''
-                    in_code_block = False
-                else:
-                    in_code_block = True
-                    # Определяем язык блока
-                    lang = line[3:].strip().lower()
-                    code_block_lang = lang
-                continue
-
-            if in_code_block:
-                code_block_lines.append(line)
-                continue
-
-            # Проверка на CSV (если строка похожа на CSV и не является заголовком)
-            if not line.startswith('#') and self._is_likely_csv(line):
-                if not in_csv:
-                    flush_csv()
-                    in_csv = True
-                csv_buffer.append(line)
-                continue
-            elif in_csv:
-                flush_csv()
-
-            # Обработка Markdown-заголовков
-            header_match = re.match(r'^(#+)\s+(.*)$', line)
-            if header_match:
-                level = len(header_match.group(1))
-                text = header_match.group(2).strip()
-                # Удаляем ** если они есть
-                text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
-
-                p = doc.add_paragraph()
-                run = p.add_run(text)
-                run.bold = True
-                if level == 1:
-                    run.font.size = Pt(18)
-                    p.style = 'Heading 1'
-                elif level == 2:
-                    run.font.size = Pt(16)
-                    p.style = 'Heading 2'
-                elif level == 3:
-                    run.font.size = Pt(14)
-                    p.style = 'Heading 3'
-                elif level >= 4:
-                    run.font.size = Pt(12)
-                    p.style = 'Heading 4'
-                continue
-
-            # Обычный текст с Markdown
-            flush_csv()
-            add_paragraph_with_markdown(line)
-
-        # Обработка остатков
-        flush_csv()
-        if in_code_block and code_block_lines:
-            p = doc.add_paragraph()
-            run = p.add_run('\n'.join(code_block_lines))
-            run.font.name = 'Courier New'
-            run.font.size = Pt(9)
-
-        # Сохраняем файл
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".docx",
-            filetypes=[("Документ Word", "*.docx"), ("Все файлы", "*.*")],
-            title="Сохранить чат как DOCX"
-        )
+        file_path = self._save_chat_as_docx(chat_text)
         if file_path:
-            doc.save(file_path)
             self.statusbar.config(text=f"Чат сохранён в DOCX: {file_path}")
+            self.add_system_message(f"📄 Чат сохранён в DOCX: {file_path}")
 
     # ---------- Копирование чата ----------
     def copy_chat(self):
@@ -2142,158 +835,7 @@ class MainWindow(tb.Window):
         self.statusbar.config(text="Чат очищен")
         self.chat_widget.add_message("*Система*: История чата очищена.", "assistant")
 
-    # ---------- Сохранение выделения из чата ----------
-    def _safe_filename(self, title: str, default: str = "untitled") -> str:
-        """Преобразует строку в безопасное имя файла (убирает недопустимые символы)."""
-        import re
-        # Убираем символы, запрещённые в именах файлов Windows/Linux
-        safe = re.sub(r'[<>:"/\\|?*]', '_', title.strip())
-        # Убираем лишние пробелы и точки в конце
-        safe = safe.strip(' .')
-        if not safe:
-            safe = default
-        # Ограничиваем длину
-        if len(safe) > 100:
-            safe = safe[:100]
-        return safe
-
-    def _save_selected_as_file(self):
-        """Сохраняет выделенный текст чата в один файл с именем из первой строки."""
-        selected = self.chat_widget.get_selected_text()
-        if not selected:
-            messagebox.showwarning("Сохранение", "Ничего не выделено в чате.")
-            return
-
-        # Первая строка (до первого переноса) как имя файла
-        first_line = selected.splitlines()[0].strip() if selected else ""
-        if not first_line:
-            first_line = "selected_text"
-
-        base_name = self._safe_filename(first_line, "selected_text")
-        default_ext = ".md" if first_line.startswith('#') else ".txt"
-
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=default_ext,
-            filetypes=[("Текстовые файлы", "*.txt"), ("Markdown", "*.md"), ("Все файлы", "*.*")],
-            initialfile=base_name + default_ext,
-            title="Сохранить выделенный текст"
-        )
-        if not file_path:
-            return
-
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(selected)
-            self.statusbar.config(text=f"Выделенный текст сохранён в {file_path}")
-            self.chat_widget.add_message(f"*Система*: Выделенный текст сохранён в {file_path}", "assistant")
-        except Exception as e:
-            messagebox.showerror("Ошибка сохранения", f"Не удалось сохранить файл:\n{e}")
-
-        def _save_selected_as_sections(self):
-            """
-            Сохраняет выделенный текст, разделяя по строкам, начинающимся с "---".
-            Каждый раздел сохраняется в отдельный файл.
-            Имя файла берётся из строки "--- <имя_файла>".
-            Удаляет обратные кавычки (```) и возможный язык (например, json) в начале и конце содержимого.
-            """
-            selected = self.chat_widget.get_selected_text()
-            if not selected:
-                messagebox.showwarning("Сохранение", "Ничего не выделено в чате.")
-                return
-
-            import re
-
-            # Разбиваем по строкам, начинающимся с "---" (возможны пробелы перед)
-            pattern = r'(?=^[ \t]*---\s+.*$)'
-            sections = re.split(pattern, selected, flags=re.MULTILINE)
-            sections = [s.strip() for s in sections if s.strip()]
-
-            if not sections:
-                messagebox.showwarning("Сохранение",
-                                       "Выделенный текст не содержит маркеров разделов (строк, начинающихся с '---').")
-                return
-
-            if len(sections) == 1:
-                reply = messagebox.askyesno("Сохранение",
-                                            "Текст не разбит на разделы (только один маркер).\n"
-                                            "Сохранить как один файл?")
-                if reply:
-                    self._save_selected_as_file()
-                return
-
-            folder_path = filedialog.askdirectory(title="Выберите папку для сохранения разделов")
-            if not folder_path:
-                return
-
-            saved_count = 0
-            errors = []
-
-            for section in sections:
-                lines = section.splitlines()
-                if not lines:
-                    continue
-
-                # Первая строка должна начинаться с "---"
-                first_line = lines[0].strip()
-                if not first_line.startswith('---'):
-                    title = "unnamed_section"
-                    content = section
-                else:
-                    # Извлекаем имя файла после "---"
-                    file_name_part = first_line[3:].strip()
-                    file_name_part = file_name_part.strip('"').strip("'")
-                    if file_name_part:
-                        title = file_name_part
-                    else:
-                        title = "unnamed_section"
-                    # Остальные строки (кроме первой) — содержимое
-                    content = "\n".join(lines[1:]).strip()
-
-                # Удаляем обратные кавычки и возможный язык в начале/конце
-                # Если содержимое начинается с ``` и заканчивается ```
-                if content.startswith('```') and content.endswith('```'):
-                    lines = content.splitlines()
-                    # Проверяем, что первая строка начинается с ``` (возможно с языком)
-                    if lines and lines[0].strip().startswith('```'):
-                        # Удаляем первую строку
-                        lines = lines[1:]
-                    if lines and lines[-1].strip() == '```':
-                        # Удаляем последнюю строку
-                        lines = lines[:-1]
-                    content = "\n".join(lines).strip()
-
-                # Дополнительно: если после удаления всё ещё есть обратные кавычки, удаляем их (на всякий случай)
-                content = re.sub(r'^```[a-zA-Z]*\s*', '', content)
-                content = re.sub(r'\s*```$', '', content)
-
-                # Формируем имя файла
-                base_name = self._safe_filename(title, "section")
-                # Если имя не содержит расширения, добавляем .txt
-                if '.' not in os.path.splitext(base_name)[1]:
-                    base_name += ".txt"
-
-                file_path = os.path.join(folder_path, base_name)
-
-                counter = 1
-                while os.path.exists(file_path):
-                    name, ext = os.path.splitext(base_name)
-                    file_path = os.path.join(folder_path, f"{name}_{counter}{ext}")
-                    counter += 1
-
-                try:
-                    with open(file_path, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    saved_count += 1
-                except Exception as e:
-                    errors.append(f"{file_path}: {e}")
-
-            if saved_count > 0:
-                self.statusbar.config(text=f"Сохранено {saved_count} разделов в {folder_path}")
-                self.add_system_message(f"📁 Сохранено {saved_count} разделов в {folder_path}")
-            if errors:
-                self.add_system_message(f"⚠️ Ошибки при сохранении:\n" + "\n".join(errors))
-
-    # ---------- Остальные обработчики (API, сигналы) ----------
+    # ---------- Обработчики API ----------
     def _on_ai_chunk(self, chunk):
         self.after(0, lambda: self._append_chunk(chunk))
 
